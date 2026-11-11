@@ -1,0 +1,301 @@
+//@version=5
+// ============================================================================
+//  XAUUSD Trend Pullback  |  H1 bias + M15 entry  |  Min 1:2 R:R
+//  Apply on the M15 chart of XAUUSD (e.g. OANDA:XAUUSD / TVC:GOLD).
+//  Educational template: backtest and forward-test before any live use.
+// ============================================================================
+strategy("XAUUSD Trend Pullback | H1 Bias + M15 Entry", shorttitle="XAU TrendPB", overlay=true,
+     initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=1,
+     pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false,
+     slippage=20, max_bars_back=500)
+
+// ----------------------------------------------------------------------------
+// INPUTS
+// ----------------------------------------------------------------------------
+gTrend = "1) Trend filter (higher timeframe)"
+htf    = input.timeframe("60", "Trend timeframe", group=gTrend)
+minSep = input.float(0.5, "Min EMA50-EMA200 gap (x H1 ATR) - avoids chop", minval=0.0, step=0.1, group=gTrend)
+
+gEntry     = "2) Entry"
+emaFastLen = input.int(20, "Fast EMA", minval=1, group=gEntry)
+emaSlowLen = input.int(50, "Slow EMA", minval=1, group=gEntry)
+atrLen     = input.int(14, "ATR length", minval=1, group=gEntry)
+rsiLen     = input.int(14, "RSI length", minval=1, group=gEntry)
+pbLookback = input.int(8, "Pullback lookback (bars)", minval=2, group=gEntry)
+legLookback= input.int(40, "Impulse leg lookback for Fib (bars)", minval=10, group=gEntry)
+minConf    = input.int(2, "Min confluence count (EMA zone / Fib 50-61.8 / PDH-PDL-round level)", minval=1, maxval=3, group=gEntry)
+roundStep  = input.float(50.0, "Round-number step ($)", minval=1.0, group=gEntry)
+useEngulf  = input.bool(true, "Trigger: engulfing candle", group=gEntry)
+usePin     = input.bool(true, "Trigger: pin bar rejection", group=gEntry)
+useBreak   = input.bool(true, "Trigger: break of minor lower high / higher low", group=gEntry)
+reqSpace   = input.bool(true, "Require 2R of room before previous day high/low", group=gEntry)
+allowLong  = input.bool(true, "Allow longs", group=gEntry)
+allowShort = input.bool(true, "Allow shorts", group=gEntry)
+
+gRisk      = "3) Risk & trade management"
+riskPct    = input.float(1.0, "Risk per trade (% of equity)", minval=0.05, maxval=5.0, step=0.05, group=gRisk)
+atrBuf     = input.float(0.5, "Stop buffer (x M15 ATR)", minval=0.0, step=0.1, group=gRisk)
+maxStopH1  = input.float(1.5, "Skip trade if stop wider than (x H1 ATR)", minval=0.5, step=0.1, group=gRisk)
+rr1        = input.float(2.0, "TP1 reward:risk", minval=1.0, step=0.1, group=gRisk)
+rr2        = input.float(3.0, "TP2 reward:risk", minval=1.0, step=0.1, group=gRisk)
+tp1Pct     = input.float(50.0, "% of position closed at TP1", minval=1.0, maxval=99.0, group=gRisk)
+timeStopBars = input.int(8, "Time stop: bars (8 x M15 = 2h)", minval=1, group=gRisk)
+maxTrades  = input.int(3, "Max trades per day", minval=1, group=gRisk)
+dailyLoss  = input.float(2.0, "Daily loss limit (%)", minval=0.1, group=gRisk)
+weeklyLoss = input.float(5.0, "Weekly loss limit (%)", minval=0.1, group=gRisk)
+maxConsec  = input.int(3, "Stop for the day after N consecutive losses", minval=1, group=gRisk)
+
+gSess      = "4) Session filter"
+tz         = input.string("Asia/Kolkata", "Timezone for session / day logic", group=gSess)
+sessInput  = input.session("1330-2330:23456", "Trading session (London open to NY close, IST)", group=gSess)
+friCutHour = input.int(21, "No new trades on Friday after this hour (0-23)", minval=0, maxval=23, group=gSess)
+closeAtEnd = input.bool(true, "Close open trades at session end", group=gSess)
+
+// ----------------------------------------------------------------------------
+// HIGHER-TIMEFRAME DATA (non-repainting: previous closed HTF bar)
+// ----------------------------------------------------------------------------
+[h1Ema50, h1Ema200, h1Atr, h1Close] = request.security(syminfo.tickerid, htf,
+     [ta.ema(close, 50)[1], ta.ema(close, 200)[1], ta.atr(14)[1], close[1]],
+     lookahead=barmerge.lookahead_on)
+
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]],
+     lookahead=barmerge.lookahead_on)
+
+// ----------------------------------------------------------------------------
+// ENTRY-TIMEFRAME INDICATORS
+// ----------------------------------------------------------------------------
+ema20 = ta.ema(close, emaFastLen)
+ema50 = ta.ema(close, emaSlowLen)
+atr   = ta.atr(atrLen)
+rsi   = ta.rsi(close, rsiLen)
+
+// ----------------------------------------------------------------------------
+// TREND BIAS (H1)
+// ----------------------------------------------------------------------------
+sepOk    = math.abs(h1Ema50 - h1Ema200) > minSep * h1Atr
+bullBias = h1Close > h1Ema200 and h1Ema50 > h1Ema200 and sepOk
+bearBias = h1Close < h1Ema200 and h1Ema50 < h1Ema200 and sepOk
+
+// ----------------------------------------------------------------------------
+// PULLBACK + CONFLUENCE
+// ----------------------------------------------------------------------------
+pbLow    = ta.lowest(low, pbLookback)
+pbHigh   = ta.highest(high, pbLookback)
+legHigh  = ta.highest(high, legLookback)
+legLow   = ta.lowest(low, legLookback)
+legRange = legHigh - legLow
+tol      = 0.25 * atr
+
+zoneTop  = math.max(ema20, ema50)
+zoneBot  = math.min(ema20, ema50)
+
+// Buy-side confluence
+buyEma = pbLow <= zoneTop + tol and pbLow >= zoneBot - atr
+buyFib = pbLow <= legHigh - 0.5 * legRange + tol and pbLow >= legHigh - 0.618 * legRange - tol
+buyLvl = math.abs(pbLow - pdl) <= 0.5 * atr or math.abs(pbLow - math.round(pbLow / roundStep) * roundStep) <= 0.5 * atr
+confBuy = (buyEma ? 1 : 0) + (buyFib ? 1 : 0) + (buyLvl ? 1 : 0)
+
+// Sell-side confluence
+sellEma = pbHigh >= zoneBot - tol and pbHigh <= zoneTop + atr
+sellFib = pbHigh >= legLow + 0.5 * legRange - tol and pbHigh <= legLow + 0.618 * legRange + tol
+sellLvl = math.abs(pbHigh - pdh) <= 0.5 * atr or math.abs(pbHigh - math.round(pbHigh / roundStep) * roundStep) <= 0.5 * atr
+confSell = (sellEma ? 1 : 0) + (sellFib ? 1 : 0) + (sellLvl ? 1 : 0)
+
+// RSI dipped toward 40-50 on a buy pullback (not below 30); mirror for sells
+rsiLowOk  = ta.lowest(rsi, pbLookback) <= 50 and ta.lowest(rsi, pbLookback) >= 30
+rsiHighOk = ta.highest(rsi, pbLookback) >= 50 and ta.highest(rsi, pbLookback) <= 70
+
+// ----------------------------------------------------------------------------
+// TRIGGER CANDLES
+// ----------------------------------------------------------------------------
+body  = math.abs(close - open)
+rng   = high - low
+lowW  = math.min(open, close) - low
+upW   = high - math.max(open, close)
+
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bullPin    = rng > 0 and lowW >= 0.6 * rng and lowW >= 2 * body
+bearPin    = rng > 0 and upW >= 0.6 * rng and upW >= 2 * body
+bullBreak  = close > open and close > ta.highest(high, 3)[1]
+bearBreak  = close < open and close < ta.lowest(low, 3)[1]
+
+buyTrigger  = (useEngulf and bullEngulf) or (usePin and bullPin) or (useBreak and bullBreak)
+sellTrigger = (useEngulf and bearEngulf) or (usePin and bearPin) or (useBreak and bearBreak)
+
+// ----------------------------------------------------------------------------
+// STOPS, SIZING
+// ----------------------------------------------------------------------------
+slBuy    = pbLow - atrBuf * atr
+slSell   = pbHigh + atrBuf * atr
+riskBuy  = close - slBuy
+riskSell = slSell - close
+
+calcQty(riskDist) =>
+    cash = strategy.equity * riskPct / 100.0
+    q = cash / (riskDist * syminfo.pointvalue)
+    math.floor(q * 100) / 100
+
+qBuy  = calcQty(riskBuy)
+qSell = calcQty(riskSell)
+
+spaceBuy  = not reqSpace or na(pdh) or pdh <= close or pdh >= close + rr1 * riskBuy
+spaceSell = not reqSpace or na(pdl) or pdl >= close or pdl <= close - rr1 * riskSell
+
+// ----------------------------------------------------------------------------
+// SESSION / DAY / WEEK STATE
+// ----------------------------------------------------------------------------
+inSession = not na(time(timeframe.period, sessInput, tz))
+isLateFri = dayofweek(time, tz) == dayofweek.friday and hour(time, tz) >= friCutHour
+
+dayKey  = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+weekKey = year(time, tz) * 100 + weekofyear(time, tz)
+newDay  = dayKey != dayKey[1]
+newWeek = weekKey != weekKey[1]
+
+var float dayStartEq  = strategy.initial_capital
+var float weekStartEq = strategy.initial_capital
+var int   tradesToday = 0
+var int   consecLoss  = 0
+var int   lastClosed  = 0
+
+if newDay
+    dayStartEq := strategy.equity
+    tradesToday := 0
+    consecLoss := 0
+if newWeek
+    weekStartEq := strategy.equity
+
+// Count consecutive losing exits
+if strategy.closedtrades > lastClosed
+    for i = lastClosed to strategy.closedtrades - 1
+        p = strategy.closedtrades.profit(i)
+        if p < 0
+            consecLoss += 1
+        else if p > 0
+            consecLoss := 0
+    lastClosed := strategy.closedtrades
+
+dailyHit  = strategy.equity <= dayStartEq * (1 - dailyLoss / 100.0)
+weeklyHit = strategy.equity <= weekStartEq * (1 - weeklyLoss / 100.0)
+
+canTrade = inSession and not isLateFri and not dailyHit and not weeklyHit and tradesToday < maxTrades and consecLoss < maxConsec and strategy.position_size == 0
+
+// ----------------------------------------------------------------------------
+// SIGNALS
+// ----------------------------------------------------------------------------
+longSignal = allowLong and canTrade and bullBias and confBuy >= minConf and buyTrigger and rsiLowOk and close > ema50 and riskBuy > 0 and riskBuy <= maxStopH1 * h1Atr and spaceBuy and qBuy > 0
+
+shortSignal = allowShort and canTrade and bearBias and confSell >= minConf and sellTrigger and rsiHighOk and close < ema50 and riskSell > 0 and riskSell <= maxStopH1 * h1Atr and spaceSell and qSell > 0
+
+// ----------------------------------------------------------------------------
+// TRADE STATE
+// ----------------------------------------------------------------------------
+var float slLvl   = na
+var float tp1Lvl  = na
+var float tp2Lvl  = na
+var float entryPx = na
+var float riskD   = na
+var bool  tp1Hit  = false
+var int   entryBar = na
+
+// Reset when flat and no new signal
+if strategy.position_size == 0 and not (longSignal or shortSignal)
+    slLvl := na
+    tp1Lvl := na
+    tp2Lvl := na
+    entryPx := na
+    riskD := na
+    tp1Hit := false
+
+// ----------------------------------------------------------------------------
+// ENTRIES (market order filled at the close of the trigger candle)
+// Alert messages are JSON for webhook bridges; edit to match your bridge's format.
+// ----------------------------------------------------------------------------
+if longSignal
+    slLvl := slBuy
+    entryPx := close
+    riskD := riskBuy
+    tp1Lvl := close + rr1 * riskBuy
+    tp2Lvl := close + rr2 * riskBuy
+    tp1Hit := false
+    entryBar := bar_index
+    tradesToday += 1
+    msgBuy = '{"action":"buy","symbol":"XAUUSD","qty":' + str.tostring(qBuy) + ',"sl":' + str.tostring(slBuy, format.mintick) + ',"tp1":' + str.tostring(tp1Lvl, format.mintick) + ',"tp2":' + str.tostring(tp2Lvl, format.mintick) + '}'
+    strategy.entry("Long", strategy.long, qty=qBuy, alert_message=msgBuy)
+    strategy.exit("TP1 L", "Long", qty_percent=tp1Pct, limit=tp1Lvl, stop=slLvl)
+    strategy.exit("TP2 L", "Long", limit=tp2Lvl, stop=slLvl)
+
+if shortSignal
+    slLvl := slSell
+    entryPx := close
+    riskD := riskSell
+    tp1Lvl := close - rr1 * riskSell
+    tp2Lvl := close - rr2 * riskSell
+    tp1Hit := false
+    entryBar := bar_index
+    tradesToday += 1
+    msgSell = '{"action":"sell","symbol":"XAUUSD","qty":' + str.tostring(qSell) + ',"sl":' + str.tostring(slSell, format.mintick) + ',"tp1":' + str.tostring(tp1Lvl, format.mintick) + ',"tp2":' + str.tostring(tp2Lvl, format.mintick) + '}'
+    strategy.entry("Short", strategy.short, qty=qSell, alert_message=msgSell)
+    strategy.exit("TP1 S", "Short", qty_percent=tp1Pct, limit=tp1Lvl, stop=slLvl)
+    strategy.exit("TP2 S", "Short", limit=tp2Lvl, stop=slLvl)
+
+// ----------------------------------------------------------------------------
+// MANAGEMENT: breakeven after TP1, time stop, session-end exit
+// ----------------------------------------------------------------------------
+if strategy.position_size != 0 and not na(entryPx)
+    isLong = strategy.position_size > 0
+
+    // TP1 reached -> stop to breakeven
+    if not tp1Hit and (isLong ? high >= tp1Lvl : low <= tp1Lvl)
+        tp1Hit := true
+        slLvl := entryPx
+
+    openR = (isLong ? close - entryPx : entryPx - close) / riskD
+
+    if not tp1Hit and bar_index - entryBar >= timeStopBars and openR < 1.0
+        strategy.close_all(comment="Time stop", alert_message='{"action":"close_all","symbol":"XAUUSD"}')
+    else if closeAtEnd and not inSession
+        strategy.close_all(comment="Session end", alert_message='{"action":"close_all","symbol":"XAUUSD"}')
+    else
+        if isLong
+            if not tp1Hit
+                strategy.exit("TP1 L", "Long", qty_percent=tp1Pct, limit=tp1Lvl, stop=slLvl)
+            strategy.exit("TP2 L", "Long", limit=tp2Lvl, stop=slLvl)
+        else
+            if not tp1Hit
+                strategy.exit("TP1 S", "Short", qty_percent=tp1Pct, limit=tp1Lvl, stop=slLvl)
+            strategy.exit("TP2 S", "Short", limit=tp2Lvl, stop=slLvl)
+
+// ----------------------------------------------------------------------------
+// PLOTS
+// ----------------------------------------------------------------------------
+plot(ema20, "EMA 20", color=color.new(color.aqua, 20), linewidth=1)
+plot(ema50, "EMA 50", color=color.new(color.orange, 10), linewidth=2)
+plot(h1Ema200, "H1 EMA 200", color=color.new(color.fuchsia, 10), linewidth=2, style=plot.style_stepline)
+plot(h1Ema50, "H1 EMA 50", color=color.new(color.yellow, 30), linewidth=1, style=plot.style_stepline)
+
+plot(strategy.position_size != 0 ? slLvl : na, "Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 and not tp1Hit ? tp1Lvl : na, "TP1", color=color.lime, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? tp2Lvl : na, "TP2", color=color.green, style=plot.style_linebr)
+
+plotshape(longSignal, "Buy", shape.triangleup, location.belowbar, color.lime, size=size.small)
+plotshape(shortSignal, "Sell", shape.triangledown, location.abovebar, color.red, size=size.small)
+bgcolor(inSession ? color.new(color.blue, 94) : na)
+
+// ----------------------------------------------------------------------------
+// DASHBOARD
+// ----------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 25), border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "H1 bias", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, bullBias ? "BULL" : bearBias ? "BEAR" : "NO TRADE", text_color=bullBias ? color.lime : bearBias ? color.red : color.gray, text_size=size.small)
+    table.cell(dash, 0, 1, "Session", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, inSession ? "ACTIVE" : "CLOSED", text_color=inSession ? color.lime : color.gray, text_size=size.small)
+    table.cell(dash, 0, 2, "Trades today", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(tradesToday) + "/" + str.tostring(maxTrades), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "Day P/L %", text_color=color.white, text_size=size.small)
+    dayPct = (strategy.equity / dayStartEq - 1) * 100
+    table.cell(dash, 1, 3, str.tostring(dayPct, "#.##") + "%", text_color=dayPct >= 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(dash, 0, 4, "Consec. losses", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(consecLoss), text_color=consecLoss >= maxConsec ? color.red : color.white, text_size=size.small)
